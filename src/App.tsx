@@ -1,79 +1,42 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { altitudeItems } from './data/altitudeItems';
-import { Credits } from './components/Credits';
+import './App.css';
 import { HeroSurface } from './components/HeroSurface';
-import { MoonArrival } from './components/MoonArrival';
+import { LayerBackground } from './components/LayerBackground';
 import { AltitudeWorld } from './components/AltitudeWorld';
-import { WORLD_HEIGHT_PX, WORLD_TOP_PADDING, formatAltitude, getLayerByAltitude, mapWorldYToAltitude } from './lib/scale';
-
-const fallbackImage =
-  'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 480"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop stop-color="%233d78d3"/><stop offset="1" stop-color="%23030818"/></linearGradient></defs><rect width="640" height="480" fill="url(%23g)"/></svg>';
-
-function useWikiImageMap() {
-  const [images, setImages] = useState<Record<string, string>>({});
-
-  useEffect(() => {
-    let cancelled = false;
-
-    async function load() {
-      const pairs = await Promise.all(
-        altitudeItems.map(async (item) => {
-          try {
-            const response = await fetch(`https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(item.wikiTitle)}`);
-            if (!response.ok) throw new Error('Image fetch failed');
-            const data = await response.json();
-            return [item.id, data.thumbnail?.source ?? data.originalimage?.source ?? fallbackImage] as const;
-          } catch {
-            return [item.id, fallbackImage] as const;
-          }
-        }),
-      );
-      if (!cancelled) setImages(Object.fromEntries(pairs));
-    }
-
-    load();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  return images;
-}
+import { Credits } from './components/Credits';
+import { WORLD_HEIGHT, WORLD_TOP, WORLD_BOTTOM, altitudeLayerName, formatAltitude, mapYToAltitude } from './lib/scale';
 
 export default function App() {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const animationRef = useRef(0);
-  const targetProgressRef = useRef(0);
+  const viewportRef = useRef<HTMLDivElement>(null);
+  const rafRef = useRef(0);
+  const targetRef = useRef(0);
 
   const [progress, setProgress] = useState(0);
   const [viewportHeight, setViewportHeight] = useState(typeof window !== 'undefined' ? window.innerHeight : 900);
   const [touchY, setTouchY] = useState<number | null>(null);
 
-  const imageMap = useWikiImageMap();
-
   useEffect(() => {
-    const handleResize = () => setViewportHeight(window.innerHeight);
-    window.addEventListener('resize', handleResize);
-    return () => window.removeEventListener('resize', handleResize);
+    const resize = () => setViewportHeight(window.innerHeight);
+    window.addEventListener('resize', resize);
+    return () => window.removeEventListener('resize', resize);
   }, []);
 
   useEffect(() => {
-    const tick = () => {
-      setProgress((prev) => prev + (targetProgressRef.current - prev) * 0.12);
-      animationRef.current = requestAnimationFrame(tick);
+    const loop = () => {
+      setProgress((prev) => prev + (targetRef.current - prev) * 0.12);
+      rafRef.current = requestAnimationFrame(loop);
     };
-    animationRef.current = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(animationRef.current);
+    rafRef.current = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(rafRef.current);
   }, []);
 
   useEffect(() => {
-    const el = containerRef.current;
-    if (!el) return;
+    const root = viewportRef.current;
+    if (!root) return;
 
     const onWheel = (event: WheelEvent) => {
       event.preventDefault();
-      const delta = -event.deltaY * 0.00048;
-      targetProgressRef.current = Math.max(0, Math.min(1, targetProgressRef.current + delta));
+      targetRef.current = Math.max(0, Math.min(1, targetRef.current - event.deltaY * 0.0005));
     };
 
     const onTouchStart = (event: TouchEvent) => setTouchY(event.touches[0]?.clientY ?? null);
@@ -83,57 +46,56 @@ export default function App() {
       event.preventDefault();
       const current = event.touches[0]?.clientY ?? touchY;
       const delta = touchY - current;
-      targetProgressRef.current = Math.max(0, Math.min(1, targetProgressRef.current + delta * 0.0016));
+      targetRef.current = Math.max(0, Math.min(1, targetRef.current + delta * 0.0016));
       setTouchY(current);
     };
 
     const onTouchEnd = () => setTouchY(null);
 
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'ArrowUp') targetProgressRef.current = Math.min(1, targetProgressRef.current + 0.025);
-      if (event.key === 'ArrowDown') targetProgressRef.current = Math.max(0, targetProgressRef.current - 0.025);
+      if (event.key === 'ArrowUp') targetRef.current = Math.min(1, targetRef.current + 0.03);
+      if (event.key === 'ArrowDown') targetRef.current = Math.max(0, targetRef.current - 0.03);
     };
 
-    el.addEventListener('wheel', onWheel, { passive: false });
-    el.addEventListener('touchstart', onTouchStart, { passive: false });
-    el.addEventListener('touchmove', onTouchMove, { passive: false });
-    el.addEventListener('touchend', onTouchEnd, { passive: true });
+    root.addEventListener('wheel', onWheel, { passive: false });
+    root.addEventListener('touchstart', onTouchStart, { passive: false });
+    root.addEventListener('touchmove', onTouchMove, { passive: false });
+    root.addEventListener('touchend', onTouchEnd, { passive: true });
     window.addEventListener('keydown', onKeyDown);
 
     return () => {
-      el.removeEventListener('wheel', onWheel);
-      el.removeEventListener('touchstart', onTouchStart);
-      el.removeEventListener('touchmove', onTouchMove);
-      el.removeEventListener('touchend', onTouchEnd);
+      root.removeEventListener('wheel', onWheel);
+      root.removeEventListener('touchstart', onTouchStart);
+      root.removeEventListener('touchmove', onTouchMove);
+      root.removeEventListener('touchend', onTouchEnd);
       window.removeEventListener('keydown', onKeyDown);
     };
   }, [touchY]);
 
-  const maxCameraTop = WORLD_HEIGHT_PX - viewportHeight;
-  const cameraTop = (1 - progress) * maxCameraTop;
-  const worldY = -cameraTop;
+  const maxTop = WORLD_HEIGHT - viewportHeight;
+  const cameraTop = (1 - progress) * maxTop;
+  const worldTransform = -cameraTop;
 
-  const cameraWorldDistance = progress * (WORLD_HEIGHT_PX - WORLD_TOP_PADDING - 900);
-  const altitude = mapWorldYToAltitude(cameraWorldDistance);
-  const layer = getLayerByAltitude(altitude);
+  const distanceFromGround = progress * (WORLD_HEIGHT - WORLD_TOP - WORLD_BOTTOM);
+  const liveAltitude = mapYToAltitude(distanceFromGround);
+  const layer = altitudeLayerName(liveAltitude);
 
-  const credits = useMemo(
-    () => Array.from(new Map(altitudeItems.map((item) => [item.imageSource, { credit: item.imageCredit, source: item.imageSource }])).values()),
-    [],
-  );
+  const hintHidden = progress > 0.08;
+
+  const moonCreditsTop = useMemo(() => WORLD_TOP + 860, []);
 
   return (
-    <div className="app-shell" ref={containerRef}>
-      <div className="micro-status">{formatAltitude(altitude)} · {layer}</div>
+    <div className="viewport" ref={viewportRef}>
+      <div className="status-pill">{formatAltitude(liveAltitude)} · {layer}</div>
 
-      <div className="world-root" style={{ transform: `translate3d(0, ${worldY}px, 0)` }}>
-        <HeroSurface top={WORLD_HEIGHT_PX - viewportHeight - 100} />
-        <AltitudeWorld imageMap={imageMap} />
-        <MoonArrival top={WORLD_TOP_PADDING + 120} moonImage={imageMap.moon ?? fallbackImage} onBack={() => (targetProgressRef.current = 0)} />
-        <Credits top={WORLD_TOP_PADDING + 760} credits={credits} />
+      <div className="world" style={{ transform: `translate3d(0, ${worldTransform}px, 0)` }}>
+        <LayerBackground />
+        <HeroSurface top={WORLD_HEIGHT - viewportHeight - 120} />
+        <AltitudeWorld onBack={() => (targetRef.current = 0)} />
+        <Credits top={moonCreditsTop} />
       </div>
 
-      <div className={`interaction-hint ${progress > 0.08 ? 'hidden' : ''}`}>Use wheel ↑ / swipe ↑ / ↑ key</div>
+      <div className={`input-hint ${hintHidden ? 'hidden' : ''}`}>Use wheel ↑ / swipe ↑ / ↑ key</div>
     </div>
   );
 }
