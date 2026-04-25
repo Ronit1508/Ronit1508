@@ -1,41 +1,36 @@
-export const GAME_TITLE = 'Nebula Run';
+export const GAME_TITLE = 'Dino Rash: Highway Chaos';
+
+export const LANES = [-6, -2, 2, 6];
 
 export const TUNING = {
-  playerSpeed: 23,
-  playerBoostSpeed: 31,
-  playerBoundsX: 15,
-  playerBoundsY: 8.8,
-  playerHealth: 100,
-  fireCooldown: 0.11,
-  rollDuration: 0.45,
-  playerBulletSpeed: 74,
-  playerBulletDamage: 22,
-  enemySpeed: 16,
-  enemyBulletSpeed: 25,
-  enemyBulletDamage: 11,
-  enemyHealth: 30,
-  enemyFireChance: 1.15,
-  enemySpawnRate: 1.0,
-  obstacleSpeed: 13,
-  obstacleSpawnRate: 1.5,
-  obstacleDamage: 16,
-  waveDuration: 22,
-  totalWaves: 3,
-  bossWarningDuration: 4,
-  bossHealth: 680,
-  bossSpeed: 8,
-  bossBulletSpeed: 28,
-  bossFireInterval: 0.95,
-  bossContactDamage: 30,
-  shakeDamping: 9,
-  hitPause: 0.045,
-  earlyRushDuration: 30,
-};
+  maxSpeed: 210,
+  minSpeed: 0,
+  baseSpeed: 70,
+  accelRate: 68,
+  brakeRate: 92,
+  drag: 18,
+  steerRate: 12,
+  roadHalfWidth: 9.5,
+  worldLength: 700,
 
-export const LANE_Z = {
-  player: 0,
-  enemySpawn: -165,
-  obstacleSpawn: -180,
-  cleanupNear: 28,
-  cleanupFar: -220,
+  playerHealth: 100,
+  playerAttackCooldown: 0.55,
+  playerAttackWindow: 0.2,
+
+  enemyBaseSpeed: 66,
+  enemySpawnInterval: 1.4,
+  trafficSpawnInterval: 1.1,
+  dinoSpawnInterval: 16,
+  dinoSpawnJitter: 8,
+
+  collisionDamageBike: 26,
+  collisionDamageTraffic: 34,
+  collisionDamageDino: 45,
+
+  nearMissBonus: 35,
+  overtakeBonus: 80,
+  takedownBonus: 250,
+  distanceScoreFactor: 1.6,
+
+  maxParticles: 280,
 };

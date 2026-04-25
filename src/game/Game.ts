@@ -1,769 +1,1031 @@
 import * as THREE from 'three';
+import { GAME_TITLE, LANES, TUNING } from './constants';
+import type { HudState, Particle, WorldActor } from './entities';
 import { InputController } from './input';
-import { GAME_TITLE, LANE_Z, TUNING } from './constants';
-import type { Bullet, Enemy, GameState, HudState, Obstacle, Particle } from './entities';
 
-interface GameCallbacks {
-  onHudUpdate: (hud: HudState) => void;
+interface PlayerRig {
+  rearWheel: THREE.Mesh;
+  frontWheel: THREE.Mesh;
+  swingArm: THREE.Group;
+  handle: THREE.Group;
+  rider: THREE.Group;
 }
 
-type WavePattern = 'line' | 'vee' | 'sweep';
-
 export class Game {
+  private scene = new THREE.Scene();
   private renderer: THREE.WebGLRenderer;
-  private scene: THREE.Scene;
   private camera: THREE.PerspectiveCamera;
   private clock = new THREE.Clock();
+  private frame = 0;
+
+  private input = new InputController();
 
   private player = new THREE.Group();
-  private playerRadius = 1.1;
-  private playerHealth = TUNING.playerHealth;
-  private fireCooldownTimer = 0;
-  private rollTimer = 0;
+  private playerRig!: PlayerRig;
+  private playerLaneX = 0;
+  private playerZ = 12;
+  private speed = TUNING.baseSpeed;
+  private attackCooldown = 0;
+  private attackTimer = 0;
 
-  private enemies: Enemy[] = [];
-  private bullets: Bullet[] = [];
-  private enemyBullets: Bullet[] = [];
+  private actors: WorldActor[] = [];
   private particles: Particle[] = [];
-  private obstacles: Obstacle[] = [];
-  private tunnelRings: THREE.Mesh[] = [];
-  private stars: THREE.Points;
-  private speedLines: THREE.Line[] = [];
 
-  private input: InputController;
-  private animationFrame = 0;
+  private roadSegments: THREE.Group[] = [];
+  private laneMarkers: THREE.Mesh[] = [];
+  private props: THREE.Object3D[] = [];
+  private horizonProps: THREE.Object3D[] = [];
 
-  private gameState: GameState = 'start';
+  private distance = 0;
   private score = 0;
-  private combo = 1;
-  private comboTimer = 0;
-  private wave = 1;
-  private waveTimer = 0;
-  private elapsed = 0;
-  private boss: Enemy | null = null;
-  private bossFireTimer = 0;
-  private bossWarningTimer = 0;
+  private health = TUNING.playerHealth;
+  private takedowns = 0;
+  private difficulty = 1;
 
-  private enemySpawnTimer = 0;
-  private obstacleSpawnTimer = 0;
-  private patternIndex = 0;
-  private damageFlash = 0;
-  private shakeStrength = 0;
-  private hitPause = 0;
+  private enemySpawn = 0;
+  private trafficSpawn = 0;
+  private dinoSpawn = 8;
+  private dinoWarning = 0;
 
-  constructor(private container: HTMLDivElement, private callbacks: GameCallbacks) {
-    this.scene = new THREE.Scene();
-    this.scene.background = new THREE.Color('#030716');
-    this.scene.fog = new THREE.Fog('#030716', 45, 250);
+  private shake = 0;
+  private nearMissLock = new Set<WorldActor>();
+  private paused = false;
+  private gameState: HudState['gameState'] = 'start';
 
-    const width = container.clientWidth;
-    const height = container.clientHeight;
-    this.camera = new THREE.PerspectiveCamera(74, width / height, 0.1, 500);
-    this.camera.position.set(0, 2.3, 9.4);
+  private dustTimer = 0;
+  private collisionFlash = 0;
+  private nearMissFlash = 0;
+
+  private cameraLookTarget = new THREE.Vector3();
+  private skyDome = new THREE.Mesh();
+
+  constructor(private host: HTMLDivElement, private onHud: (hud: HudState) => void) {
+    this.scene.background = new THREE.Color('#d3c0a1');
+    this.scene.fog = new THREE.Fog('#d6c2a1', 48, 235);
+
+    this.camera = new THREE.PerspectiveCamera(64, host.clientWidth / host.clientHeight, 0.1, 1100);
+    this.camera.position.set(0, 5.1, 18.5);
 
     this.renderer = new THREE.WebGLRenderer({ antialias: true });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    this.renderer.setSize(width, height);
+    this.renderer.setSize(host.clientWidth, host.clientHeight);
+    this.renderer.shadowMap.enabled = true;
+    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    this.renderer.toneMappingExposure = 1.1;
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
-    container.appendChild(this.renderer.domElement);
+    host.appendChild(this.renderer.domElement);
 
-    this.input = new InputController(this.renderer.domElement);
-
-    this.stars = this.buildStars();
-    this.scene.add(this.stars);
-
+    this.setupAtmosphere();
     this.setupLights();
-    this.setupPlayer();
-    this.setupTunnel();
-    this.setupSpeedLines();
+    this.createWorld();
+    this.createPlayer();
+    this.updateHud();
 
     window.addEventListener('resize', this.onResize);
-
-    this.updateHud();
     this.animate();
   }
 
   dispose() {
-    cancelAnimationFrame(this.animationFrame);
-    this.input.dispose();
+    cancelAnimationFrame(this.frame);
     window.removeEventListener('resize', this.onResize);
+    this.input.dispose();
     this.renderer.dispose();
-    this.container.removeChild(this.renderer.domElement);
+    if (this.host.contains(this.renderer.domElement)) this.host.removeChild(this.renderer.domElement);
   }
 
   private onResize = () => {
-    const w = this.container.clientWidth;
-    const h = this.container.clientHeight;
+    const w = this.host.clientWidth;
+    const h = this.host.clientHeight;
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(w, h);
   };
 
+  private setupAtmosphere() {
+    const canvas = document.createElement('canvas');
+    canvas.width = 32;
+    canvas.height = 1024;
+    const ctx = canvas.getContext('2d');
+    if (ctx) {
+      const grad = ctx.createLinearGradient(0, 0, 0, canvas.height);
+      grad.addColorStop(0, '#6ca2cf');
+      grad.addColorStop(0.4, '#9bc4de');
+      grad.addColorStop(0.7, '#f0c083');
+      grad.addColorStop(1, '#f2d8a9');
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+    }
+
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.colorSpace = THREE.SRGBColorSpace;
+
+    this.skyDome = new THREE.Mesh(
+      new THREE.SphereGeometry(900, 28, 22),
+      new THREE.MeshBasicMaterial({ map: tex, side: THREE.BackSide, depthWrite: false }),
+    );
+    this.skyDome.position.y = -100;
+    this.scene.add(this.skyDome);
+  }
+
+  private setupLights() {
+    const hemi = new THREE.HemisphereLight('#fff6db', '#8a6447', 0.75);
+    this.scene.add(hemi);
+
+    const ambient = new THREE.AmbientLight('#f8d7af', 0.25);
+    this.scene.add(ambient);
+
+    const sun = new THREE.DirectionalLight('#ffe4ba', 2.6);
+    sun.position.set(55, 82, 8);
+    sun.castShadow = true;
+    sun.shadow.mapSize.set(2048, 2048);
+    sun.shadow.camera.left = -130;
+    sun.shadow.camera.right = 130;
+    sun.shadow.camera.top = 130;
+    sun.shadow.camera.bottom = -130;
+    sun.shadow.camera.near = 1;
+    sun.shadow.camera.far = 340;
+    sun.shadow.bias = -0.00012;
+    this.scene.add(sun);
+
+    const rim = new THREE.DirectionalLight('#7ba8dc', 0.55);
+    rim.position.set(-45, 15, -25);
+    this.scene.add(rim);
+  }
+
+  private createWorld() {
+    const asphalt = this.makeRoadTexture();
+    asphalt.wrapS = asphalt.wrapT = THREE.RepeatWrapping;
+    asphalt.repeat.set(1, 10);
+
+    const roadMat = new THREE.MeshStandardMaterial({
+      map: asphalt,
+      roughness: 0.92,
+      metalness: 0.08,
+      color: '#85878a',
+    });
+    const shoulderMat = new THREE.MeshStandardMaterial({ color: '#8f6f52', roughness: 1, metalness: 0 });
+    const rumbleMat = new THREE.MeshStandardMaterial({ color: '#c8ad7d', roughness: 0.8 });
+    const markerMat = new THREE.MeshStandardMaterial({ color: '#ece7d5', emissive: '#f8edbf', emissiveIntensity: 0.12 });
+
+    for (let i = 0; i < 18; i += 1) {
+      const seg = new THREE.Group();
+      const z = -i * 48;
+
+      const road = new THREE.Mesh(new THREE.BoxGeometry(22.5, 0.25, 50), roadMat);
+      road.receiveShadow = true;
+      road.castShadow = false;
+      road.position.y = -0.13;
+      seg.add(road);
+
+      const leftShoulder = new THREE.Mesh(new THREE.BoxGeometry(11.4, 0.2, 50), shoulderMat);
+      leftShoulder.position.set(-17.1, -0.14, 0);
+      leftShoulder.receiveShadow = true;
+      seg.add(leftShoulder);
+
+      const rightShoulder = leftShoulder.clone();
+      rightShoulder.position.x = 17.1;
+      seg.add(rightShoulder);
+
+      const leftRumble = new THREE.Mesh(new THREE.BoxGeometry(0.45, 0.03, 50), rumbleMat);
+      leftRumble.position.set(-10.9, 0.02, 0);
+      seg.add(leftRumble);
+      const rightRumble = leftRumble.clone();
+      rightRumble.position.x = 10.9;
+      seg.add(rightRumble);
+
+      for (let m = 0; m < 10; m += 1) {
+        const marker = new THREE.Mesh(new THREE.BoxGeometry(0.32, 0.02, 2.4), markerMat);
+        marker.position.set(0, 0.03, -22 + m * 5);
+        marker.receiveShadow = true;
+        seg.add(marker);
+        this.laneMarkers.push(marker);
+      }
+
+      seg.position.set(0, 0, z);
+      this.scene.add(seg);
+      this.roadSegments.push(seg);
+    }
+
+    const terrainMat = new THREE.MeshStandardMaterial({ color: '#b69064', roughness: 1 });
+    const terrain = new THREE.Mesh(new THREE.PlaneGeometry(500, 1300), terrainMat);
+    terrain.rotation.x = -Math.PI / 2;
+    terrain.position.y = -0.2;
+    terrain.receiveShadow = true;
+    this.scene.add(terrain);
+
+    for (let i = 0; i < 190; i += 1) {
+      this.spawnRoadsideProp(i);
+    }
+
+    for (let i = 0; i < 55; i += 1) {
+      const dune = new THREE.Mesh(
+        new THREE.ConeGeometry(14 + Math.random() * 16, 12 + Math.random() * 18, 6),
+        new THREE.MeshStandardMaterial({ color: '#b08358', roughness: 0.97 }),
+      );
+      dune.position.set((Math.random() > 0.5 ? 1 : -1) * (45 + Math.random() * 120), 5 + Math.random() * 8, -120 - i * 45);
+      dune.rotation.y = Math.random() * Math.PI;
+      this.scene.add(dune);
+      this.horizonProps.push(dune);
+    }
+
+    for (let i = 0; i < 24; i += 1) {
+      const massif = new THREE.Mesh(
+        new THREE.ConeGeometry(35 + Math.random() * 24, 48 + Math.random() * 26, 7),
+        new THREE.MeshStandardMaterial({ color: i % 2 === 0 ? '#89684e' : '#7f5d44', roughness: 0.98 }),
+      );
+      massif.position.set(i % 2 === 0 ? -180 - Math.random() * 55 : 180 + Math.random() * 55, 30, -220 - i * 110);
+      massif.rotation.y = Math.random() * Math.PI;
+      this.scene.add(massif);
+      this.horizonProps.push(massif);
+    }
+  }
+
+  private makeRoadTexture() {
+    const canvas = document.createElement('canvas');
+    canvas.width = 512;
+    canvas.height = 2048;
+    const ctx = canvas.getContext('2d');
+    if (ctx) {
+      ctx.fillStyle = '#404346';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      for (let i = 0; i < 16000; i += 1) {
+        const gray = 45 + Math.floor(Math.random() * 45);
+        ctx.fillStyle = `rgba(${gray},${gray},${gray},${Math.random() * 0.18})`;
+        ctx.fillRect(Math.random() * canvas.width, Math.random() * canvas.height, 1 + Math.random() * 2, 1 + Math.random() * 2);
+      }
+
+      for (let i = 0; i < 400; i += 1) {
+        const y = (i / 400) * canvas.height;
+        ctx.fillStyle = `rgba(255,255,255,${0.018 + Math.random() * 0.03})`;
+        ctx.fillRect(0, y, canvas.width, 1);
+      }
+
+      ctx.strokeStyle = 'rgba(0,0,0,0.25)';
+      ctx.lineWidth = 1.2;
+      for (let i = 0; i < 10; i += 1) {
+        ctx.beginPath();
+        ctx.moveTo(0, i * 200 + Math.random() * 30);
+        ctx.lineTo(canvas.width, i * 200 + 50 + Math.random() * 30);
+        ctx.stroke();
+      }
+    }
+
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.anisotropy = 8;
+    return tex;
+  }
+
+  private spawnRoadsideProp(index: number) {
+    const z = -index * 30 - Math.random() * 20;
+    const side = Math.random() > 0.5 ? 1 : -1;
+    const x = side * (14 + Math.random() * 15);
+    const type = Math.floor(Math.random() * 7);
+    let root = new THREE.Group();
+
+    if (type === 0) {
+      const pole = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.08, 0.11, 4.2, 8),
+        new THREE.MeshStandardMaterial({ color: '#7f8387', roughness: 0.6 }),
+      );
+      pole.castShadow = true;
+      const sign = new THREE.Mesh(
+        new THREE.BoxGeometry(1.9, 1.2, 0.2),
+        new THREE.MeshStandardMaterial({ color: Math.random() > 0.5 ? '#2c6bc7' : '#2e9a57', roughness: 0.55 }),
+      );
+      sign.position.y = 1.5;
+      sign.castShadow = true;
+      root.add(pole, sign);
+    } else if (type === 1) {
+      const body = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.24, 0.34, 2.7, 8),
+        new THREE.MeshStandardMaterial({ color: '#3c5f3f', roughness: 0.9 }),
+      );
+      const armL = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.11, 0.11, 1.25, 8),
+        new THREE.MeshStandardMaterial({ color: '#3b6a43', roughness: 0.9 }),
+      );
+      armL.rotation.z = Math.PI / 2;
+      armL.position.set(-0.52, 0.36, 0);
+      const armR = armL.clone();
+      armR.position.x = 0.52;
+      root.add(body, armL, armR);
+    } else if (type === 2) {
+      const rock = new THREE.Mesh(
+        new THREE.DodecahedronGeometry(0.75 + Math.random() * 0.8),
+        new THREE.MeshStandardMaterial({ color: '#82664f', roughness: 1 }),
+      );
+      rock.scale.y = 0.75;
+      root.add(rock);
+    } else if (type === 3) {
+      const barrier = new THREE.Mesh(
+        new THREE.BoxGeometry(2.4, 0.5, 0.35),
+        new THREE.MeshStandardMaterial({ color: '#bca26f', roughness: 0.7 }),
+      );
+      barrier.position.y = 0.25;
+      root.add(barrier);
+    } else if (type === 4) {
+      const bush = new THREE.Mesh(
+        new THREE.IcosahedronGeometry(0.6 + Math.random() * 0.4, 0),
+        new THREE.MeshStandardMaterial({ color: '#7d6947', roughness: 1 }),
+      );
+      bush.scale.y = 0.6;
+      root.add(bush);
+    } else if (type === 5) {
+      const wreckBody = new THREE.Mesh(
+        new THREE.BoxGeometry(1.5, 0.5, 2.3),
+        new THREE.MeshStandardMaterial({ color: '#5d3932', roughness: 0.8 }),
+      );
+      wreckBody.rotation.y = Math.random() * 0.4;
+      wreckBody.position.y = 0.25;
+      root.add(wreckBody);
+    } else {
+      const post = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.06, 0.08, 1.8, 8),
+        new THREE.MeshStandardMaterial({ color: '#6b6c70', roughness: 0.6 }),
+      );
+      post.position.y = 0.9;
+      const reflector = new THREE.Mesh(
+        new THREE.BoxGeometry(0.18, 0.22, 0.06),
+        new THREE.MeshStandardMaterial({ color: '#f1d9a3', emissive: '#f1d9a3', emissiveIntensity: 0.3 }),
+      );
+      reflector.position.y = 1.65;
+      root.add(post, reflector);
+    }
+
+    root.position.set(x, 0.6, z);
+    root.traverse((obj: THREE.Object3D) => {
+      if ((obj as THREE.Mesh).isMesh) {
+        const mesh = obj as THREE.Mesh;
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
+      }
+    });
+
+    this.scene.add(root);
+    this.props.push(root);
+  }
+
+  private createPlayer() {
+    const bike = new THREE.Group();
+
+    const frame = new THREE.Mesh(
+      new THREE.BoxGeometry(1.2, 0.45, 3.3),
+      new THREE.MeshStandardMaterial({ color: '#9a1010', metalness: 0.72, roughness: 0.23 }),
+    );
+    frame.position.y = 0.7;
+
+    const tank = new THREE.Mesh(
+      new THREE.CapsuleGeometry(0.42, 1.25, 8, 10),
+      new THREE.MeshStandardMaterial({ color: '#cc2020', metalness: 0.66, roughness: 0.24 }),
+    );
+    tank.rotation.x = Math.PI / 2;
+    tank.position.set(0, 0.98, 0.1);
+
+    const seat = new THREE.Mesh(
+      new THREE.BoxGeometry(0.75, 0.2, 1.1),
+      new THREE.MeshStandardMaterial({ color: '#111317', roughness: 0.65 }),
+    );
+    seat.position.set(0, 0.95, 0.78);
+
+    const fairing = new THREE.Mesh(
+      new THREE.ConeGeometry(0.45, 1.2, 12),
+      new THREE.MeshStandardMaterial({ color: '#171c24', metalness: 0.5, roughness: 0.3 }),
+    );
+    fairing.rotation.x = -Math.PI / 2;
+    fairing.position.set(0, 0.9, -1.45);
+
+    const windscreen = new THREE.Mesh(
+      new THREE.BoxGeometry(0.5, 0.35, 0.12),
+      new THREE.MeshStandardMaterial({ color: '#9cc3de', transparent: true, opacity: 0.65, metalness: 0.8, roughness: 0.1 }),
+    );
+    windscreen.position.set(0, 1.2, -1.35);
+
+    const rearWheel = this.makeWheel(0.45, 0.15);
+    rearWheel.position.set(0, 0.34, 1.35);
+
+    const frontWheel = this.makeWheel(0.45, 0.15);
+    frontWheel.position.set(0, 0.34, -1.28);
+
+    const swingArm = new THREE.Group();
+    const forkL = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.05, 0.06, 1.1, 10),
+      new THREE.MeshStandardMaterial({ color: '#a3a6aa', metalness: 0.85, roughness: 0.22 }),
+    );
+    forkL.position.set(-0.21, 0.78, -1.17);
+    forkL.rotation.x = 0.36;
+    const forkR = forkL.clone();
+    forkR.position.x = 0.21;
+    swingArm.add(forkL, forkR);
+
+    const handle = new THREE.Group();
+    const bar = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.04, 0.04, 0.7, 10),
+      new THREE.MeshStandardMaterial({ color: '#9b9fa4', metalness: 0.85, roughness: 0.2 }),
+    );
+    bar.rotation.z = Math.PI / 2;
+    bar.position.set(0, 1.2, -0.95);
+    handle.add(bar);
+
+    const exhaust = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.1, 0.13, 1.1, 10),
+      new THREE.MeshStandardMaterial({ color: '#7c7f83', metalness: 0.9, roughness: 0.3 }),
+    );
+    exhaust.rotation.z = Math.PI / 2;
+    exhaust.position.set(-0.52, 0.52, 0.8);
+
+    const rider = new THREE.Group();
+    const torso = new THREE.Mesh(
+      new THREE.CapsuleGeometry(0.3, 0.74, 6, 10),
+      new THREE.MeshStandardMaterial({ color: '#11151a', roughness: 0.7 }),
+    );
+    torso.position.set(0, 1.44, 0.2);
+    torso.rotation.x = -0.2;
+
+    const helmet = new THREE.Mesh(
+      new THREE.SphereGeometry(0.26, 14, 12),
+      new THREE.MeshStandardMaterial({ color: '#171d23', roughness: 0.4, metalness: 0.35 }),
+    );
+    helmet.position.set(0, 1.9, -0.2);
+
+    const visor = new THREE.Mesh(
+      new THREE.BoxGeometry(0.22, 0.11, 0.13),
+      new THREE.MeshStandardMaterial({ color: '#97b8d3', metalness: 0.7, roughness: 0.22 }),
+    );
+    visor.position.set(0, 1.87, -0.42);
+
+    const legL = new THREE.Mesh(new THREE.CapsuleGeometry(0.13, 0.56, 4, 8), new THREE.MeshStandardMaterial({ color: '#13171d', roughness: 0.7 }));
+    legL.position.set(-0.2, 1.02, 0.65);
+    legL.rotation.x = 0.4;
+    const legR = legL.clone();
+    legR.position.x = 0.2;
+
+    rider.add(torso, helmet, visor, legL, legR);
+
+    bike.add(frame, tank, seat, fairing, windscreen, rearWheel, frontWheel, swingArm, handle, exhaust, rider);
+    bike.position.set(0, 0.5, this.playerZ);
+    bike.traverse((obj: THREE.Object3D) => {
+      if ((obj as THREE.Mesh).isMesh) {
+        const mesh = obj as THREE.Mesh;
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
+      }
+    });
+
+    this.player.add(bike);
+    this.player.position.copy(bike.position);
+    this.scene.add(this.player);
+
+    this.playerRig = { rearWheel, frontWheel, swingArm, handle, rider };
+  }
+
+  private makeWheel(radius: number, tube: number) {
+    const tire = new THREE.Mesh(
+      new THREE.TorusGeometry(radius, tube, 14, 24),
+      new THREE.MeshStandardMaterial({ color: '#16191d', roughness: 0.96 }),
+    );
+    tire.rotation.y = Math.PI / 2;
+
+    const hub = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.11, 0.11, 0.22, 10),
+      new THREE.MeshStandardMaterial({ color: '#90979f', metalness: 0.75, roughness: 0.2 }),
+    );
+    hub.rotation.z = Math.PI / 2;
+
+    const wheel = new THREE.Group();
+    wheel.add(tire, hub);
+
+    const spokeMat = new THREE.MeshStandardMaterial({ color: '#a4acb3', metalness: 0.82, roughness: 0.2 });
+    for (let i = 0; i < 8; i += 1) {
+      const spoke = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.03, radius * 1.65), spokeMat);
+      spoke.rotation.x = (Math.PI * 2 * i) / 8;
+      wheel.add(spoke);
+    }
+
+    return wheel as unknown as THREE.Mesh;
+  }
+
+  private createEnemyBike(x: number, z: number): WorldActor {
+    const g = new THREE.Group();
+    const body = new THREE.Mesh(
+      new THREE.BoxGeometry(1.05, 0.42, 2.8),
+      new THREE.MeshStandardMaterial({ color: '#1d2c74', metalness: 0.5, roughness: 0.4 }),
+    );
+    body.position.y = 0.62;
+    const rider = new THREE.Mesh(
+      new THREE.CapsuleGeometry(0.25, 0.62, 4, 8),
+      new THREE.MeshStandardMaterial({ color: '#1a2128', roughness: 0.7 }),
+    );
+    rider.position.set(0, 1.2, 0.15);
+    const front = this.makeWheel(0.35, 0.12);
+    front.position.set(0, 0.35, -1.08);
+    const rear = this.makeWheel(0.35, 0.12);
+    rear.position.set(0, 0.35, 1.08);
+    g.add(body, rider, front, rear);
+    g.position.set(x, 0.12, z);
+    g.traverse((obj: THREE.Object3D) => {
+      if ((obj as THREE.Mesh).isMesh) (obj as THREE.Mesh).castShadow = true;
+    });
+    this.scene.add(g);
+    return { mesh: g, kind: 'enemy', lane: x, z, speed: TUNING.enemyBaseSpeed + Math.random() * 20, radius: 1.02, health: 1 };
+  }
+
+  private createTraffic(x: number, z: number): WorldActor {
+    const truck = Math.random() < 0.4;
+    const g = new THREE.Group();
+    const body = new THREE.Mesh(
+      new THREE.BoxGeometry(truck ? 2.4 : 1.95, truck ? 1.85 : 1.3, truck ? 6.2 : 4.4),
+      new THREE.MeshStandardMaterial({
+        color: truck ? '#8d672f' : '#7b1f2c',
+        metalness: 0.28,
+        roughness: 0.52,
+      }),
+    );
+    body.position.y = truck ? 0.95 : 0.66;
+
+    const cabin = new THREE.Mesh(
+      new THREE.BoxGeometry(truck ? 2.0 : 1.45, 0.62, truck ? 1.8 : 1.2),
+      new THREE.MeshStandardMaterial({ color: '#9cc1dc', metalness: 0.72, roughness: 0.16, transparent: true, opacity: 0.82 }),
+    );
+    cabin.position.set(0, truck ? 1.55 : 1.12, truck ? -1.85 : -1.25);
+
+    const brakeLight = new THREE.Mesh(
+      new THREE.BoxGeometry(0.2, 0.1, 0.07),
+      new THREE.MeshStandardMaterial({ color: '#ce3f31', emissive: '#ce3f31', emissiveIntensity: 0.6 }),
+    );
+    brakeLight.position.set(0.65, truck ? 0.95 : 0.7, 2.1);
+    const brakeLight2 = brakeLight.clone();
+    brakeLight2.position.x = -0.65;
+
+    g.add(body, cabin, brakeLight, brakeLight2);
+    g.position.set(x, 0.03, z);
+    g.traverse((obj: THREE.Object3D) => {
+      if ((obj as THREE.Mesh).isMesh) {
+        const mesh = obj as THREE.Mesh;
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
+      }
+    });
+    this.scene.add(g);
+    return { mesh: g, kind: 'traffic', lane: x, z, speed: 30 + Math.random() * 30, radius: truck ? 1.7 : 1.35, health: 4 };
+  }
+
+  private createDino(z: number): WorldActor {
+    const g = new THREE.Group();
+    const skin = new THREE.MeshStandardMaterial({ color: '#4f6a52', roughness: 0.92, metalness: 0.04 });
+    const darkSkin = new THREE.MeshStandardMaterial({ color: '#3b4d3d', roughness: 0.95, metalness: 0.03 });
+
+    const torso = new THREE.Mesh(new THREE.CapsuleGeometry(1.45, 4.0, 12, 16), skin);
+    torso.rotation.z = Math.PI / 2;
+    torso.position.y = 2.9;
+
+    const hips = new THREE.Mesh(new THREE.SphereGeometry(1.1, 14, 12), darkSkin);
+    hips.position.set(-2.1, 2.5, 0);
+
+    const neck = new THREE.Mesh(new THREE.CapsuleGeometry(0.52, 2.2, 9, 11), skin);
+    neck.position.set(2.7, 3.85, -0.25);
+    neck.rotation.z = -0.46;
+
+    const head = new THREE.Mesh(new THREE.BoxGeometry(1.75, 0.92, 2.2), skin);
+    head.position.set(4.22, 3.72, -0.3);
+
+    const jaw = new THREE.Mesh(new THREE.BoxGeometry(1.6, 0.28, 1.8), darkSkin);
+    jaw.position.set(4.33, 3.26, -0.3);
+
+    const tail = new THREE.Mesh(new THREE.ConeGeometry(0.52, 4.3, 12), darkSkin);
+    tail.position.set(-4.2, 2.65, 0);
+    tail.rotation.z = -Math.PI / 2;
+
+    const legGeo = new THREE.CylinderGeometry(0.33, 0.4, 2.7, 10);
+    const legFL = new THREE.Mesh(legGeo, darkSkin);
+    legFL.position.set(1.1, 1.25, -0.95);
+    const legFR = legFL.clone();
+    legFR.position.z = 0.95;
+    const legBL = legFL.clone();
+    legBL.position.x = -1.4;
+    const legBR = legFR.clone();
+    legBR.position.x = -1.4;
+
+    g.add(torso, hips, neck, head, jaw, tail, legFL, legFR, legBL, legBR);
+    g.position.set(-16, 0, z);
+    g.traverse((obj: THREE.Object3D) => {
+      if ((obj as THREE.Mesh).isMesh) {
+        const mesh = obj as THREE.Mesh;
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
+      }
+    });
+
+    this.scene.add(g);
+
+    return {
+      mesh: g,
+      kind: 'dino',
+      lane: 0,
+      z,
+      speed: 45,
+      radius: 3,
+      health: 10,
+      aggressive: false,
+      roarTimer: 2.8,
+    };
+  }
+
   private animate = () => {
-    this.animationFrame = requestAnimationFrame(this.animate);
+    this.frame = requestAnimationFrame(this.animate);
     const dt = Math.min(this.clock.getDelta(), 0.033);
 
     if (this.gameState === 'start' && this.input.consumeStart()) this.startGame();
-    if ((this.gameState === 'gameover' || this.gameState === 'victory') && this.input.consumeRestart()) this.startGame();
+    if (this.gameState === 'gameover' && this.input.consumeRestart()) this.startGame();
 
-    if (this.gameState === 'playing') {
-      this.updateGame(dt);
+    if (this.gameState === 'playing' && this.input.consumePause()) {
+      this.paused = !this.paused;
+      this.gameState = this.paused ? 'paused' : 'playing';
+    } else if (this.gameState === 'paused' && this.input.consumePause()) {
+      this.paused = false;
+      this.gameState = 'playing';
     }
 
-    this.updateVisualEffects(dt);
+    if (this.gameState === 'playing' && !this.paused) this.update(dt);
+    this.updateEffects(dt);
+
     this.renderer.render(this.scene, this.camera);
   };
 
   private startGame() {
     this.gameState = 'playing';
-    this.score = 0;
-    this.combo = 1;
-    this.comboTimer = 0;
-    this.wave = 1;
-    this.waveTimer = 0;
-    this.elapsed = 0;
-    this.playerHealth = TUNING.playerHealth;
-    this.fireCooldownTimer = 0;
-    this.rollTimer = 0;
-    this.enemySpawnTimer = 0;
-    this.obstacleSpawnTimer = 0;
-    this.patternIndex = 0;
-    this.damageFlash = 0;
-    this.boss = null;
-    this.bossFireTimer = 0;
-    this.bossWarningTimer = 0;
-    this.hitPause = 0;
-
-    for (const e of this.enemies) this.scene.remove(e.mesh);
-    for (const b of [...this.bullets, ...this.enemyBullets]) this.scene.remove(b.mesh);
-    for (const p of this.particles) this.scene.remove(p.mesh);
-    for (const o of this.obstacles) this.scene.remove(o.mesh);
-    this.enemies = [];
-    this.bullets = [];
-    this.enemyBullets = [];
-    this.particles = [];
-    this.obstacles = [];
-
-    this.player.position.set(0, 0, LANE_Z.player);
+    this.paused = false;
+    this.speed = TUNING.baseSpeed;
+    this.playerLaneX = 0;
+    this.player.position.set(0, 0.5, this.playerZ);
     this.player.rotation.set(0, 0, 0);
+    this.attackCooldown = 0;
+    this.attackTimer = 0;
+    this.distance = 0;
+    this.score = 0;
+    this.health = TUNING.playerHealth;
+    this.takedowns = 0;
+    this.difficulty = 1;
+    this.enemySpawn = 0;
+    this.trafficSpawn = 0;
+    this.dinoSpawn = 9;
+    this.dinoWarning = 0;
+    this.shake = 0;
+    this.collisionFlash = 0;
+    this.nearMissFlash = 0;
+
+    for (const actor of this.actors) this.scene.remove(actor.mesh);
+    for (const particle of this.particles) this.scene.remove(particle.mesh);
+    this.actors = [];
+    this.particles = [];
+    this.nearMissLock.clear();
+
     this.updateHud();
   }
 
-  private updateGame(dt: number) {
-    if (this.hitPause > 0) {
-      this.hitPause = Math.max(0, this.hitPause - dt);
-      this.updateParticles(dt * 0.35);
-      this.updateHud();
-      return;
+  private update(dt: number) {
+    this.difficulty += dt * 0.018;
+    this.attackCooldown = Math.max(0, this.attackCooldown - dt);
+    this.attackTimer = Math.max(0, this.attackTimer - dt);
+
+    if (this.input.accelerate) this.speed += TUNING.accelRate * dt;
+    else this.speed -= TUNING.drag * dt;
+    if (this.input.brake) this.speed -= TUNING.brakeRate * dt;
+    this.speed = THREE.MathUtils.clamp(this.speed, TUNING.minSpeed, TUNING.maxSpeed + this.difficulty * 12);
+
+    this.playerLaneX += this.input.steer * TUNING.steerRate * dt * (0.6 + this.speed / 230);
+    this.playerLaneX = THREE.MathUtils.clamp(this.playerLaneX, -TUNING.roadHalfWidth + 0.85, TUNING.roadHalfWidth - 0.85);
+
+    const bob = Math.sin(this.distance * 48) * 0.03;
+    const accelPitch = (this.input.accelerate ? -0.04 : 0) + (this.input.brake ? 0.06 : 0);
+    this.player.rotation.z = THREE.MathUtils.lerp(this.player.rotation.z, -this.input.steer * 0.38, dt * 11);
+    this.player.rotation.y = THREE.MathUtils.lerp(this.player.rotation.y, -this.input.steer * 0.08, dt * 8);
+    this.player.rotation.x = THREE.MathUtils.lerp(this.player.rotation.x, accelPitch, dt * 8);
+    this.player.position.x = THREE.MathUtils.lerp(this.player.position.x, this.playerLaneX, dt * 12);
+    this.player.position.y = 0.5 + bob;
+
+    this.playerRig.rearWheel.rotation.x += dt * (this.speed * 0.34);
+    this.playerRig.frontWheel.rotation.x += dt * (this.speed * 0.34);
+    this.playerRig.handle.rotation.y = THREE.MathUtils.lerp(this.playerRig.handle.rotation.y, this.input.steer * 0.25, dt * 8);
+    this.playerRig.swingArm.position.y = THREE.MathUtils.lerp(this.playerRig.swingArm.position.y, this.input.brake ? -0.05 : 0, dt * 10);
+    this.playerRig.rider.rotation.z = THREE.MathUtils.lerp(this.playerRig.rider.rotation.z, -this.input.steer * 0.12, dt * 8);
+
+    if (this.input.consumeAttack() && this.attackCooldown <= 0) {
+      this.attackCooldown = TUNING.playerAttackCooldown;
+      this.attackTimer = TUNING.playerAttackWindow;
+      this.spawnSparks(this.player.position.clone().add(new THREE.Vector3(1.0, 0.95, -1.2)), 12, '#ffd898', 2.4);
     }
 
-    this.elapsed += dt;
-    this.waveTimer += dt;
-    this.enemySpawnTimer += dt;
-    this.obstacleSpawnTimer += dt;
-    this.fireCooldownTimer -= dt;
-    this.rollTimer = Math.max(0, this.rollTimer - dt);
-    this.comboTimer = Math.max(0, this.comboTimer - dt);
+    this.enemySpawn += dt;
+    this.trafficSpawn += dt;
+    this.dinoSpawn -= dt;
 
-    if (this.comboTimer === 0) this.combo = 1;
+    const enemyCadence = Math.max(0.45, TUNING.enemySpawnInterval - this.difficulty * 0.2);
+    const trafficCadence = Math.max(0.4, TUNING.trafficSpawnInterval - this.difficulty * 0.13);
 
-    this.updatePlayer(dt);
-
-    if (this.bossWarningTimer > 0) {
-      this.bossWarningTimer = Math.max(0, this.bossWarningTimer - dt);
-      if (this.bossWarningTimer === 0) this.spawnBoss();
-    } else {
-      this.updateSpawners();
+    if (this.enemySpawn >= enemyCadence) {
+      this.enemySpawn = 0;
+      this.spawnEnemy();
     }
 
-    this.updateEnemies(dt);
-    this.updateBullets(dt);
-    this.updateObstacles(dt);
+    if (this.trafficSpawn >= trafficCadence) {
+      this.trafficSpawn = 0;
+      this.spawnTraffic();
+    }
+
+    if (this.dinoSpawn <= 0 && !this.actors.some((a) => a.kind === 'dino')) {
+      this.spawnDinoEvent();
+      this.dinoSpawn = TUNING.dinoSpawnInterval + Math.random() * TUNING.dinoSpawnJitter - Math.min(this.difficulty * 2, 8);
+    }
+
+    this.updateActors(dt);
+    this.updateEnvironment(dt);
     this.updateParticles(dt);
-    this.handleCollisions();
 
-    if (!this.boss && this.bossWarningTimer === 0 && this.wave <= TUNING.totalWaves && this.waveTimer > TUNING.waveDuration) {
-      this.wave += 1;
-      this.waveTimer = 0;
-      if (this.wave > TUNING.totalWaves) this.bossWarningTimer = TUNING.bossWarningDuration;
-    }
+    this.distance += this.speed * dt * 0.001;
+    this.score += dt * (this.speed * TUNING.distanceScoreFactor + this.difficulty * 10);
 
-    if (this.playerHealth <= 0) this.gameState = 'gameover';
+    const speedNorm = THREE.MathUtils.clamp(this.speed / 240, 0, 1);
+    const fovTarget = 63 + speedNorm * 26 + this.nearMissFlash * 2.5;
+    this.camera.fov = THREE.MathUtils.lerp(this.camera.fov, fovTarget, dt * 3.2);
+    this.camera.updateProjectionMatrix();
 
-    if (this.boss && this.boss.health <= 0) {
-      this.scene.remove(this.boss.mesh);
-      this.enemies = this.enemies.filter((e) => e !== this.boss);
-      this.boss = null;
-      this.gameState = 'victory';
-      this.createExplosion(new THREE.Vector3(0, 0, -24), 150, '#76f7ff', 2.6);
-      this.shakeStrength += 0.26;
-    }
+    const camTarget = new THREE.Vector3(
+      this.player.position.x * 0.58,
+      5 + speedNorm * 1.5 + this.collisionFlash * 0.15,
+      this.player.position.z + 19.5 - speedNorm * 2.5,
+    );
+    this.camera.position.lerp(camTarget, dt * 5.8);
 
+    this.cameraLookTarget.set(
+      this.player.position.x * 0.2,
+      1.2 + speedNorm * 0.5,
+      this.player.position.z - 18,
+    );
+    this.camera.lookAt(this.cameraLookTarget);
+    this.camera.rotation.z = THREE.MathUtils.lerp(this.camera.rotation.z, -this.input.steer * 0.06 + this.collisionFlash * 0.02, dt * 6);
+
+    if (this.health <= 0) this.gameOver();
     this.updateHud();
   }
 
-  private updatePlayer(dt: number) {
-    const move = this.input.movement;
-    const rolling = this.rollTimer > 0;
-    const speed = rolling ? TUNING.playerBoostSpeed : TUNING.playerSpeed;
+  private updateActors(dt: number) {
+    const passed: WorldActor[] = [];
 
-    this.player.position.x = THREE.MathUtils.clamp(this.player.position.x + move.x * speed * dt, -TUNING.playerBoundsX, TUNING.playerBoundsX);
-    this.player.position.y = THREE.MathUtils.clamp(this.player.position.y + move.y * speed * dt, -TUNING.playerBoundsY, TUNING.playerBoundsY);
-
-    if (this.input.consumeRoll() && this.rollTimer <= 0) this.rollTimer = TUNING.rollDuration;
-
-    const rollPhase = rolling ? (1 - this.rollTimer / TUNING.rollDuration) * Math.PI * 2 : 0;
-    this.player.rotation.z = -move.x * 0.5 + Math.sin(rollPhase) * 0.82;
-    this.player.rotation.x = -move.y * 0.15;
-
-    if (this.input.consumeShoot() && this.fireCooldownTimer <= 0) {
-      this.fireCooldownTimer = TUNING.fireCooldown;
-      this.spawnPlayerBullet();
-      this.spawnMuzzleFlash();
-    }
-
-    const targetZ = 9.4 - move.length() * 0.26;
-    this.camera.position.x = THREE.MathUtils.lerp(this.camera.position.x, this.player.position.x * 0.34, 8 * dt);
-    this.camera.position.y = THREE.MathUtils.lerp(this.camera.position.y, 2.25 + this.player.position.y * 0.25, 8 * dt);
-    this.camera.position.z = THREE.MathUtils.lerp(this.camera.position.z, targetZ, 6 * dt);
-    this.camera.rotation.z = THREE.MathUtils.lerp(this.camera.rotation.z, -move.x * 0.12, 6 * dt);
-    this.camera.rotation.x = THREE.MathUtils.lerp(this.camera.rotation.x, -move.y * 0.02, 4 * dt);
-    this.camera.fov = THREE.MathUtils.lerp(this.camera.fov, 74 + Math.min(move.length() * 4 + (this.elapsed < TUNING.earlyRushDuration ? 2 : 0), 8), 6 * dt);
-    this.camera.updateProjectionMatrix();
-    this.camera.position.x += (Math.random() - 0.5) * this.shakeStrength;
-    this.camera.position.y += (Math.random() - 0.5) * this.shakeStrength;
-    this.shakeStrength = THREE.MathUtils.lerp(this.shakeStrength, 0, dt * TUNING.shakeDamping);
-  }
-
-  private updateSpawners() {
-    const rushFactor = this.elapsed < TUNING.earlyRushDuration ? 0.8 : 1;
-    if (!this.boss && this.wave <= TUNING.totalWaves && this.enemySpawnTimer >= TUNING.enemySpawnRate * rushFactor) {
-      this.enemySpawnTimer = 0;
-      this.spawnEnemyWave();
-    }
-
-    if (!this.boss && this.obstacleSpawnTimer >= TUNING.obstacleSpawnRate) {
-      this.obstacleSpawnTimer = 0;
-      this.spawnObstacle();
-    }
-  }
-
-  private updateEnemies(dt: number) {
-    for (const enemy of this.enemies) {
-      enemy.hitFlash = Math.max(0, (enemy.hitFlash ?? 0) - dt * 4.2);
-      if (enemy.isBoss) {
-        enemy.phase = (enemy.phase ?? 0) + dt;
-        enemy.mesh.position.x = Math.sin((enemy.phase ?? 0) * 1.3) * 10;
-        enemy.mesh.position.y = 1 + Math.sin((enemy.phase ?? 0) * 2.2) * 1.3;
-        enemy.mesh.position.z = THREE.MathUtils.lerp(enemy.mesh.position.z, -44, dt * 2.2);
-        this.bossFireTimer += dt;
-        if (this.bossFireTimer >= TUNING.bossFireInterval) {
-          this.bossFireTimer = 0;
-          this.spawnBossBulletPattern(enemy.mesh.position.clone());
+    for (const actor of this.actors) {
+      if (actor.kind === 'dino') {
+        actor.roarTimer = Math.max(0, (actor.roarTimer ?? 0) - dt);
+        if (actor.roarTimer! < 2.0 && !actor.aggressive) {
+          actor.aggressive = true;
+          actor.mesh.position.x = -11;
+          this.shake = Math.max(this.shake, 0.5);
+          for (let i = 0; i < 3; i += 1) {
+            this.spawnDustBurst(actor.mesh.position.clone().add(new THREE.Vector3(0, 0.2, (i - 1) * 1.5)), 16);
+          }
         }
+
+        if (actor.aggressive) {
+          actor.mesh.position.x = THREE.MathUtils.lerp(actor.mesh.position.x, 10, dt * (1.35 + this.difficulty * 0.16));
+          actor.mesh.rotation.y = 0.22;
+        }
+
+        actor.mesh.position.z += (this.speed - actor.speed) * dt;
+        actor.mesh.position.y = Math.abs(Math.sin(performance.now() * 0.004)) * 0.2;
       } else {
-        enemy.phase = (enemy.phase ?? 0) + dt;
-        enemy.mesh.position.addScaledVector(enemy.velocity, dt);
-        enemy.mesh.position.x += Math.sin((enemy.phase ?? 0) * 3 + (enemy.laneBias ?? 0)) * dt * 3;
-        enemy.mesh.rotation.z += dt * 1.2;
-        enemy.mesh.rotation.y += dt * 0.9;
-        enemy.fireTimer -= dt;
-        if (enemy.fireTimer <= 0 && Math.random() < TUNING.enemyFireChance * dt) {
-          enemy.fireTimer = enemy.fireCadence;
-          this.spawnEnemyBullet(enemy.mesh.position.clone());
+        actor.mesh.position.z += (this.speed - actor.speed) * dt;
+        if (actor.kind === 'enemy') {
+          const pull = THREE.MathUtils.clamp((this.player.position.x - actor.mesh.position.x) * 0.75, -1, 1);
+          actor.mesh.position.x += pull * dt * (2.4 + this.difficulty * 0.4);
+          actor.mesh.rotation.z = THREE.MathUtils.lerp(actor.mesh.rotation.z, -pull * 0.3, dt * 6);
+          actor.mesh.rotation.x = Math.sin((actor.mesh.position.z + performance.now() * 0.02) * 0.18) * 0.03;
         }
       }
 
-      if ((enemy.hitFlash ?? 0) > 0) {
-        const emissive = (enemy.mesh.children[0].material as THREE.MeshStandardMaterial).emissive;
-        emissive.setRGB(0.65, 0.35, 0.35);
-      } else if (!enemy.isBoss) {
-        (enemy.mesh.children[0].material as THREE.MeshStandardMaterial).emissive.setRGB(0.05, 0.02, 0.04);
-      }
-    }
+      actor.z = actor.mesh.position.z;
 
-    this.enemies = this.enemies.filter((enemy) => {
-      if (!enemy.isBoss && enemy.mesh.position.z > LANE_Z.cleanupNear) {
-        this.scene.remove(enemy.mesh);
-        return false;
+      if (actor.z > this.playerZ + 27) {
+        passed.push(actor);
+        continue;
       }
-      return true;
-    });
-  }
 
-  private updateBullets(dt: number) {
-    const updateBulletList = (list: Bullet[]) => {
-      for (const bullet of list) {
-        bullet.mesh.position.addScaledVector(bullet.velocity, dt);
-        bullet.life -= dt;
-        if (!bullet.fromEnemy) {
-          this.spawnBulletTrail(bullet.mesh.position.clone());
+      const dz = actor.z - this.playerZ;
+      if (dz > -8.5 && dz < 0.6 && Math.abs(actor.mesh.position.x - this.player.position.x) < actor.radius + 1.05) {
+        this.handleCollision(actor);
+      }
+
+      if (actor.kind !== 'dino' && actor.z > this.playerZ && !this.nearMissLock.has(actor)) {
+        const laneDelta = Math.abs(actor.mesh.position.x - this.player.position.x);
+        if (laneDelta < 2.0) {
+          this.score += TUNING.nearMissBonus;
+          this.nearMissLock.add(actor);
+          this.nearMissFlash = 1;
+          this.spawnSparks(this.player.position.clone().add(new THREE.Vector3(0, 0.3, -0.7)), 8, '#f9dd9b', 1.8);
         }
       }
-      return list.filter((bullet) => {
-        const alive = bullet.life > 0 && bullet.mesh.position.z > LANE_Z.cleanupFar && bullet.mesh.position.z < 50;
-        if (!alive) this.scene.remove(bullet.mesh);
-        return alive;
-      });
-    };
 
-    this.bullets = updateBulletList(this.bullets);
-    this.enemyBullets = updateBulletList(this.enemyBullets);
-  }
+      if (actor.kind === 'enemy' && this.attackTimer > 0) {
+        const lateral = Math.abs(actor.mesh.position.x - this.player.position.x);
+        const closeZ = actor.z > this.playerZ - 3.4 && actor.z < this.playerZ + 1.8;
+        if (lateral < 2.15 && closeZ && actor.health > 0) {
+          actor.health = 0;
+          actor.dead = true;
+          this.takedowns += 1;
+          this.score += TUNING.takedownBonus;
+          this.spawnSparks(actor.mesh.position.clone().add(new THREE.Vector3(0, 0.8, 0)), 20, '#ff9e62', 4.4);
+          actor.mesh.rotation.z += (Math.random() > 0.5 ? 1 : -1) * 0.8;
+          actor.speed = 10;
+          this.shake = Math.max(this.shake, 0.2);
+        }
+      }
 
-  private updateObstacles(dt: number) {
-    for (const obstacle of this.obstacles) {
-      obstacle.mesh.position.addScaledVector(obstacle.velocity, dt);
-      obstacle.mesh.rotation.x += dt * 0.85;
-      obstacle.mesh.rotation.y += dt * 0.55;
+      if (actor.kind === 'enemy' && actor.z > this.playerZ + 2.1 && !actor.dead) {
+        this.score += TUNING.overtakeBonus;
+        actor.dead = true;
+      }
     }
 
-    this.obstacles = this.obstacles.filter((obstacle) => {
-      if (obstacle.mesh.position.z > LANE_Z.cleanupNear) {
-        this.scene.remove(obstacle.mesh);
-        return false;
+    for (const actor of passed) {
+      this.scene.remove(actor.mesh);
+      this.actors = this.actors.filter((a) => a !== actor);
+      this.nearMissLock.delete(actor);
+    }
+
+    for (const actor of this.actors.filter((a) => a.dead && a.kind === 'enemy')) {
+      actor.mesh.position.y -= dt * 3;
+      actor.mesh.rotation.x += dt * 6.5;
+      if (actor.mesh.position.y < -3) {
+        this.scene.remove(actor.mesh);
+        this.actors = this.actors.filter((a) => a !== actor);
       }
-      return true;
-    });
+    }
+  }
+
+  private handleCollision(actor: WorldActor) {
+    let damage = TUNING.collisionDamageBike;
+    if (actor.kind === 'traffic') damage = TUNING.collisionDamageTraffic;
+    if (actor.kind === 'dino') damage = TUNING.collisionDamageDino;
+
+    this.health -= damage;
+    this.speed *= 0.55;
+    this.shake = Math.max(this.shake, actor.kind === 'dino' ? 0.86 : 0.42);
+    this.collisionFlash = 1;
+
+    this.spawnSparks(this.player.position.clone().add(new THREE.Vector3(0, 0.45, -0.4)), 32, '#ffcd85', 6.3);
+    this.spawnSparks(actor.mesh.position.clone().add(new THREE.Vector3(0, 0.9, 0)), 20, '#ff764f', 4.2);
+
+    if (actor.kind !== 'dino') {
+      actor.dead = true;
+      actor.speed = 0;
+      actor.mesh.rotation.z += (Math.random() * 0.7 + 0.4) * (Math.random() > 0.5 ? 1 : -1);
+    }
+
+    if (actor.kind === 'dino') {
+      actor.aggressive = true;
+      this.dinoWarning = 1.8;
+      this.spawnDustBurst(this.player.position.clone().add(new THREE.Vector3(0, 0.2, -1.2)), 22);
+    }
+  }
+
+  private updateEnvironment(dt: number) {
+    const travel = this.speed * dt;
+    this.dustTimer += dt * (0.45 + this.speed / 130);
+
+    if (this.dustTimer > 0.032) {
+      this.dustTimer = 0;
+      this.spawnDustTrail();
+    }
+
+    for (const seg of this.roadSegments) {
+      seg.position.z += travel;
+      seg.position.x = Math.sin((this.distance * 2.2 + seg.position.z) * 0.004) * 0.45;
+      if (seg.position.z > this.playerZ + 45) seg.position.z -= 18 * 48;
+    }
+
+    for (const obj of this.props) {
+      obj.position.z += travel;
+      if (obj.position.z > this.playerZ + 65) {
+        obj.position.z -= TUNING.worldLength + Math.random() * 360;
+        obj.position.x = (obj.position.x > 0 ? 1 : -1) * (14 + Math.random() * 15);
+      }
+    }
+
+    for (const obj of this.horizonProps) {
+      obj.position.z += travel * 0.28;
+      if (obj.position.z > this.playerZ + 240) obj.position.z -= 3000;
+    }
+
+    this.camera.position.x += (Math.random() - 0.5) * this.shake;
+    this.camera.position.y += (Math.random() - 0.5) * this.shake;
+    this.shake = THREE.MathUtils.lerp(this.shake, 0, dt * 6.2);
+  }
+
+  private updateEffects(dt: number) {
+    if (this.dinoWarning > 0) this.dinoWarning = Math.max(0, this.dinoWarning - dt);
+    this.collisionFlash = Math.max(0, this.collisionFlash - dt * 3.5);
+    this.nearMissFlash = Math.max(0, this.nearMissFlash - dt * 2.2);
+    this.renderer.toneMappingExposure = 1.07 + this.collisionFlash * 0.2 + this.nearMissFlash * 0.08;
+  }
+
+  private spawnEnemy() {
+    const lane = LANES[Math.floor(Math.random() * LANES.length)] + (Math.random() - 0.5) * 0.55;
+    const enemy = this.createEnemyBike(lane, -150 - Math.random() * 140);
+    this.actors.push(enemy);
+  }
+
+  private spawnTraffic() {
+    const lane = LANES[Math.floor(Math.random() * LANES.length)] + (Math.random() - 0.5) * 0.45;
+    const traffic = this.createTraffic(lane, -170 - Math.random() * 140);
+    this.actors.push(traffic);
+  }
+
+  private spawnDinoEvent() {
+    const dino = this.createDino(-190 - Math.random() * 80);
+    this.actors.push(dino);
+    this.dinoWarning = 4.4;
+    this.shake = Math.max(this.shake, 0.62);
+    this.score += 150;
+
+    const ringCenter = new THREE.Vector3(0, 0.2, this.playerZ - 80);
+    for (let i = 0; i < 4; i += 1) {
+      this.spawnDustBurst(ringCenter.clone().add(new THREE.Vector3((i - 1.5) * 3.2, 0, 0)), 18);
+    }
+  }
+
+  private spawnDustTrail() {
+    const spread = this.input.steer === 0 ? 0.72 : 1.0;
+    const pos = this.player.position.clone().add(new THREE.Vector3((Math.random() - 0.5) * spread, -0.24, 1.25));
+    this.spawnParticle(pos, '#ceb28f', 0.85 + Math.random() * 0.52, new THREE.Vector3((Math.random() - 0.5) * 1.5, Math.random() * 1.0, 3.2 + Math.random() * 2.3), 0.12 + Math.random() * 0.15);
+  }
+
+  private spawnDustBurst(origin: THREE.Vector3, count: number) {
+    for (let i = 0; i < count; i += 1) {
+      const vel = new THREE.Vector3((Math.random() - 0.5) * 4.4, Math.random() * 2.6, (Math.random() - 0.5) * 2.5);
+      this.spawnParticle(origin, '#c2a57f', 0.62 + Math.random() * 0.36, vel, 0.13 + Math.random() * 0.2);
+    }
+  }
+
+  private spawnSparks(origin: THREE.Vector3, count: number, color: string, speed: number) {
+    for (let i = 0; i < count; i += 1) {
+      const vel = new THREE.Vector3((Math.random() - 0.5) * speed, Math.random() * speed * 0.5, (Math.random() - 0.5) * speed);
+      this.spawnParticle(origin, color, 0.35 + Math.random() * 0.35, vel, 0.05 + Math.random() * 0.08);
+    }
+  }
+
+  private spawnParticle(origin: THREE.Vector3, color: string, life: number, velocity: THREE.Vector3, size: number) {
+    if (this.particles.length >= TUNING.maxParticles) return;
+    const mesh = new THREE.Mesh(
+      new THREE.SphereGeometry(size, 6, 6),
+      new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 0.45, roughness: 0.45, transparent: true }),
+    );
+    mesh.position.copy(origin);
+    this.scene.add(mesh);
+    this.particles.push({ mesh, life, maxLife: life, velocity });
   }
 
   private updateParticles(dt: number) {
     for (const p of this.particles) {
-      p.mesh.position.addScaledVector(p.velocity, dt);
       p.life -= dt;
-      const alpha = Math.max(p.life / p.maxLife, 0);
-      (p.mesh.material as THREE.MeshBasicMaterial).opacity = alpha;
-      p.mesh.scale.setScalar(0.35 + (1 - alpha) * 1.5);
+      p.mesh.position.addScaledVector(p.velocity, dt);
+      p.velocity.y -= dt * 5;
+      const scale = Math.max(0, p.life / p.maxLife);
+      p.mesh.scale.setScalar(scale);
+      const mat = p.mesh.material as THREE.MeshStandardMaterial;
+      mat.opacity = scale;
     }
 
-    this.particles = this.particles.filter((p) => {
-      const alive = p.life > 0;
-      if (!alive) this.scene.remove(p.mesh);
-      return alive;
-    });
-  }
-
-  private handleCollisions() {
-    const playerBulletsToRemove = new Set<Bullet>();
-
-    for (const bullet of this.bullets) {
-      for (const enemy of this.enemies) {
-        if (bullet.mesh.position.distanceTo(enemy.mesh.position) < bullet.radius + enemy.radius) {
-          enemy.health -= bullet.damage;
-          enemy.hitFlash = 1;
-          playerBulletsToRemove.add(bullet);
-          this.createExplosion(bullet.mesh.position.clone(), enemy.isBoss ? 12 : 9, enemy.isBoss ? '#ff5ce1' : '#ffab72', 0.8);
-          this.shakeStrength += enemy.isBoss ? 0.05 : 0.02;
-          this.hitPause = Math.max(this.hitPause, TUNING.hitPause * (enemy.isBoss ? 0.6 : 0.4));
-          break;
-        }
-      }
-    }
-
-    for (const bullet of playerBulletsToRemove) this.scene.remove(bullet.mesh);
-    this.bullets = this.bullets.filter((b) => !playerBulletsToRemove.has(b));
-
-    for (const enemy of this.enemies) {
-      if (enemy.health <= 0 && !enemy.isBoss) {
-        this.scene.remove(enemy.mesh);
-        this.combo = Math.min(8, this.combo + 0.5);
-        this.comboTimer = 3.3;
-        this.score += Math.floor(125 * this.combo);
-        this.createExplosion(enemy.mesh.position.clone(), 30, '#ffc26e', 1.5);
-      }
-    }
-
-    this.enemies = this.enemies.filter((enemy) => enemy.health > 0 || enemy.isBoss);
-
-    const removeEnemyBullets = new Set<Bullet>();
-    for (const bullet of this.enemyBullets) {
-      if (bullet.mesh.position.distanceTo(this.player.position) < this.playerRadius + bullet.radius) {
-        removeEnemyBullets.add(bullet);
-        this.playerDamage(bullet.damage);
-      }
-    }
-    for (const bullet of removeEnemyBullets) this.scene.remove(bullet.mesh);
-    this.enemyBullets = this.enemyBullets.filter((b) => !removeEnemyBullets.has(b));
-
-    for (const enemy of this.enemies) {
-      if (enemy.mesh.position.distanceTo(this.player.position) < this.playerRadius + enemy.radius) {
-        this.playerDamage(enemy.isBoss ? TUNING.bossContactDamage : 19);
-        if (!enemy.isBoss) {
-          enemy.health = 0;
-          this.scene.remove(enemy.mesh);
-        }
-      }
-    }
-
-    for (const obstacle of this.obstacles) {
-      if (obstacle.mesh.position.distanceTo(this.player.position) < this.playerRadius + obstacle.radius) {
-        this.playerDamage(TUNING.obstacleDamage);
-        this.scene.remove(obstacle.mesh);
-        obstacle.radius = -1;
-        this.createExplosion(obstacle.mesh.position.clone(), 18, '#9dbeff', 1.2);
-      }
-    }
-
-    this.obstacles = this.obstacles.filter((o) => o.radius > 0);
-  }
-
-  private updateVisualEffects(dt: number) {
-    const rushBoost = this.gameState === 'playing' && this.elapsed < TUNING.earlyRushDuration ? 8 : 0;
-
-    for (const ring of this.tunnelRings) {
-      ring.position.z += (33 + rushBoost) * dt;
-      ring.rotation.z += dt * 0.18;
-      if (ring.position.z > 16) {
-        ring.position.z = -240;
-        ring.position.x = (Math.random() - 0.5) * 7;
-        ring.position.y = (Math.random() - 0.5) * 4;
-      }
-    }
-
-    const starPos = this.stars.geometry.attributes.position as THREE.BufferAttribute;
-    for (let i = 0; i < starPos.count; i += 1) {
-      let z = starPos.getZ(i) + (68 + rushBoost * 2) * dt;
-      if (z > 35) z = -340;
-      starPos.setZ(i, z);
-    }
-    starPos.needsUpdate = true;
-
-    for (const line of this.speedLines) {
-      line.position.z += (96 + rushBoost * 2.8) * dt;
-      if (line.position.z > 30) {
-        line.position.z = -260;
-        line.position.x = (Math.random() - 0.5) * 40;
-        line.position.y = (Math.random() - 0.5) * 24;
-      }
-    }
-
-    this.damageFlash = Math.max(0, this.damageFlash - dt * 2.8);
-    const mix = this.damageFlash * 0.5;
-    this.scene.background = new THREE.Color().lerpColors(new THREE.Color('#030716'), new THREE.Color('#50171d'), mix);
-  }
-
-  private spawnPlayerBullet() {
-    const geo = new THREE.CapsuleGeometry(0.13, 1.8, 2, 6);
-    const mat = new THREE.MeshBasicMaterial({ color: '#90feff' });
-    const mesh = new THREE.Mesh(geo, mat);
-    mesh.rotation.x = Math.PI / 2;
-    mesh.position.copy(this.player.position).add(new THREE.Vector3(0, 0.1, -1.7));
-
-    this.scene.add(mesh);
-    this.bullets.push({
-      mesh,
-      velocity: new THREE.Vector3(0, 0, -TUNING.playerBulletSpeed),
-      radius: 0.42,
-      damage: TUNING.playerBulletDamage,
-      fromEnemy: false,
-      life: 3,
-    });
-  }
-
-  private spawnBulletTrail(position: THREE.Vector3) {
-    if (Math.random() > 0.8) return;
-    const geo = new THREE.SphereGeometry(0.08, 6, 6);
-    const mat = new THREE.MeshBasicMaterial({ color: '#69f5ff', transparent: true, opacity: 0.9 });
-    const mesh = new THREE.Mesh(geo, mat);
-    mesh.position.copy(position);
-    this.scene.add(mesh);
-    this.particles.push({ mesh, velocity: new THREE.Vector3(0, 0, 2), life: 0.15, maxLife: 0.15 });
-  }
-
-  private spawnEnemyBullet(position: THREE.Vector3) {
-    const geo = new THREE.SphereGeometry(0.3, 10, 10);
-    const mat = new THREE.MeshBasicMaterial({ color: '#ff5873' });
-    const mesh = new THREE.Mesh(geo, mat);
-    mesh.position.copy(position);
-
-    const dir = this.player.position.clone().sub(position).normalize();
-    this.scene.add(mesh);
-    this.enemyBullets.push({
-      mesh,
-      velocity: dir.multiplyScalar(TUNING.enemyBulletSpeed),
-      radius: 0.36,
-      damage: TUNING.enemyBulletDamage,
-      fromEnemy: true,
-      life: 6,
-    });
-  }
-
-  private spawnBossBulletPattern(origin: THREE.Vector3) {
-    const spread = [-1.05, -0.7, -0.3, 0, 0.3, 0.7, 1.05];
-    for (const sx of spread) {
-      const geo = new THREE.SphereGeometry(0.35, 10, 10);
-      const mat = new THREE.MeshBasicMaterial({ color: '#ff54f4' });
-      const mesh = new THREE.Mesh(geo, mat);
-      mesh.position.copy(origin).add(new THREE.Vector3(sx * 2.9, -0.4, 1));
-      const dir = new THREE.Vector3(sx * 0.32, Math.abs(sx) * -0.06, 1).normalize();
-      this.scene.add(mesh);
-      this.enemyBullets.push({
-        mesh,
-        velocity: dir.multiplyScalar(TUNING.bossBulletSpeed),
-        radius: 0.4,
-        damage: 16,
-        fromEnemy: true,
-        life: 8,
-      });
+    const remove = this.particles.filter((p) => p.life <= 0);
+    for (const p of remove) {
+      this.scene.remove(p.mesh);
+      this.particles = this.particles.filter((x) => x !== p);
     }
   }
 
-  private spawnEnemyWave() {
-    const waveSize = this.elapsed < TUNING.earlyRushDuration ? 5 : 3 + Math.min(this.wave, 4);
-    const patterns: WavePattern[] = ['line', 'vee', 'sweep'];
-    const pattern = patterns[this.patternIndex % patterns.length];
-    this.patternIndex += 1;
-
-    for (let i = 0; i < waveSize; i += 1) {
-      const enemy = this.createEnemyMesh();
-      const xBase = (i - (waveSize - 1) / 2) * 2.7;
-      let x = xBase;
-      let y = 0;
-
-      if (pattern === 'line') {
-        y = ((i % 2 === 0 ? 1 : -1) * 2.5) + (Math.random() - 0.5);
-      } else if (pattern === 'vee') {
-        y = -Math.abs(xBase) * 0.25;
-      } else {
-        x = Math.sin(i * 0.8) * 9;
-        y = Math.cos(i * 0.7) * 3.2;
-      }
-
-      enemy.position.set(x, y, LANE_Z.enemySpawn - i * 7.5);
-      this.scene.add(enemy);
-
-      this.enemies.push({
-        mesh: enemy,
-        velocity: new THREE.Vector3(0, (Math.random() - 0.5) * 0.5, TUNING.enemySpeed + this.wave * 1.1),
-        health: TUNING.enemyHealth + this.wave * 8,
-        maxHealth: TUNING.enemyHealth + this.wave * 8,
-        radius: 1.15,
-        fireTimer: Math.random() * 1.4,
-        fireCadence: THREE.MathUtils.randFloat(0.8, 1.55),
-        phase: Math.random() * Math.PI * 2,
-        laneBias: x,
-      });
-    }
-  }
-
-  private spawnObstacle() {
-    const geo = new THREE.IcosahedronGeometry(1 + Math.random() * 1.7, 0);
-    const mat = new THREE.MeshStandardMaterial({ color: '#4f638f', flatShading: true, emissive: '#12203d' });
-    const mesh = new THREE.Mesh(geo, mat);
-    mesh.position.set((Math.random() - 0.5) * 27, (Math.random() - 0.5) * 15, LANE_Z.obstacleSpawn);
-    this.scene.add(mesh);
-
-    this.obstacles.push({
-      mesh,
-      velocity: new THREE.Vector3((Math.random() - 0.5) * 1.7, (Math.random() - 0.5) * 0.4, TUNING.obstacleSpeed + Math.random() * 6),
-      radius: 1.4,
-    });
-  }
-
-  private spawnBoss() {
-    const bossMesh = this.createBossMesh();
-    bossMesh.position.set(0, 1, -92);
-    this.scene.add(bossMesh);
-
-    this.boss = {
-      mesh: bossMesh,
-      velocity: new THREE.Vector3(0, 0, 2.8),
-      health: TUNING.bossHealth,
-      maxHealth: TUNING.bossHealth,
-      radius: 5,
-      fireTimer: 0,
-      fireCadence: TUNING.bossFireInterval,
-      isBoss: true,
-      phase: 0,
-    };
-    this.enemies.push(this.boss);
-  }
-
-  private createEnemyMesh() {
-    const group = new THREE.Group();
-
-    const body = new THREE.Mesh(
-      new THREE.ConeGeometry(0.9, 2.2, 5),
-      new THREE.MeshStandardMaterial({ color: '#f35c74', flatShading: true, emissive: '#18060b' }),
-    );
-    body.rotation.x = Math.PI / 2;
-
-    const wing = new THREE.Mesh(
-      new THREE.BoxGeometry(2.2, 0.24, 0.8),
-      new THREE.MeshStandardMaterial({ color: '#c83b57', flatShading: true }),
-    );
-
-    const core = new THREE.Mesh(
-      new THREE.OctahedronGeometry(0.38, 0),
-      new THREE.MeshBasicMaterial({ color: '#ff9ab5' }),
-    );
-    core.position.z = 0.65;
-
-    group.add(body, wing, core);
-    return group;
-  }
-
-  private createBossMesh() {
-    const group = new THREE.Group();
-
-    const hull = new THREE.Mesh(
-      new THREE.CylinderGeometry(1.8, 3.8, 9, 8),
-      new THREE.MeshStandardMaterial({ color: '#4f2477', flatShading: true, emissive: '#1a0829' }),
-    );
-    hull.rotation.x = Math.PI / 2;
-
-    const nose = new THREE.Mesh(
-      new THREE.ConeGeometry(1.5, 3.2, 6),
-      new THREE.MeshStandardMaterial({ color: '#7437a8', flatShading: true }),
-    );
-    nose.rotation.x = Math.PI / 2;
-    nose.position.z = -5.6;
-
-    const wings = new THREE.Mesh(
-      new THREE.BoxGeometry(11, 0.5, 2.3),
-      new THREE.MeshStandardMaterial({ color: '#7f2ec0', flatShading: true }),
-    );
-
-    const core = new THREE.Mesh(
-      new THREE.OctahedronGeometry(1.3, 0),
-      new THREE.MeshBasicMaterial({ color: '#ff74de' }),
-    );
-    core.position.z = -1.6;
-
-    group.add(hull, nose, wings, core);
-    return group;
-  }
-
-  private setupLights() {
-    const ambient = new THREE.AmbientLight('#6d8dff', 0.7);
-    const key = new THREE.DirectionalLight('#9ce8ff', 1.3);
-    key.position.set(4, 7, 5);
-    const fill = new THREE.DirectionalLight('#ff4e8a', 0.7);
-    fill.position.set(-6, -2, 4);
-    this.scene.add(ambient, key, fill);
-  }
-
-  private setupPlayer() {
-    const hull = new THREE.Mesh(
-      new THREE.ConeGeometry(0.8, 2.6, 5),
-      new THREE.MeshStandardMaterial({ color: '#67ecff', flatShading: true, emissive: '#10313b' }),
-    );
-    hull.rotation.x = Math.PI / 2;
-
-    const canopy = new THREE.Mesh(
-      new THREE.SphereGeometry(0.36, 10, 10),
-      new THREE.MeshStandardMaterial({ color: '#c3fcff', emissive: '#29657c', flatShading: true }),
-    );
-    canopy.position.set(0, 0.25, 0.2);
-
-    const wings = new THREE.Mesh(
-      new THREE.BoxGeometry(2.8, 0.16, 1),
-      new THREE.MeshStandardMaterial({ color: '#3ac7d5', flatShading: true }),
-    );
-
-    const rear = new THREE.Mesh(
-      new THREE.CylinderGeometry(0.28, 0.28, 0.95, 8),
-      new THREE.MeshBasicMaterial({ color: '#8fffff' }),
-    );
-    rear.rotation.x = Math.PI / 2;
-    rear.position.z = 1.35;
-
-    this.player.add(hull, canopy, wings, rear);
-    this.scene.add(this.player);
-  }
-
-  private setupTunnel() {
-    for (let i = 0; i < 16; i += 1) {
-      const radius = 14.5 + (i % 4) * 1.6;
-      const geo = new THREE.TorusGeometry(radius, 0.16, 6, 44);
-      const hue = 0.5 + (i % 5) * 0.05;
-      const mat = new THREE.MeshBasicMaterial({
-        color: new THREE.Color().setHSL(hue, 0.95, 0.58),
-        transparent: true,
-        opacity: 0.55,
-      });
-      const ring = new THREE.Mesh(geo, mat);
-      ring.position.z = -i * 16;
-      ring.rotation.x = Math.PI / 2;
-      ring.position.x = Math.sin(i * 0.8) * 3.4;
-      ring.position.y = Math.cos(i * 0.6) * 2.7;
-      this.tunnelRings.push(ring);
-      this.scene.add(ring);
-    }
-  }
-
-  private buildStars() {
-    const geo = new THREE.BufferGeometry();
-    const count = 980;
-    const arr = new Float32Array(count * 3);
-    for (let i = 0; i < count; i += 1) {
-      arr[i * 3] = (Math.random() - 0.5) * 190;
-      arr[i * 3 + 1] = (Math.random() - 0.5) * 130;
-      arr[i * 3 + 2] = -Math.random() * 350;
-    }
-    geo.setAttribute('position', new THREE.BufferAttribute(arr, 3));
-    const mat = new THREE.PointsMaterial({ color: '#cae2ff', size: 0.26, transparent: true, opacity: 0.85 });
-    return new THREE.Points(geo, mat);
-  }
-
-  private setupSpeedLines() {
-    for (let i = 0; i < 64; i += 1) {
-      const geometry = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -5)]);
-      const material = new THREE.LineBasicMaterial({ color: '#8ad8ff', transparent: true, opacity: 0.35 });
-      const line = new THREE.Line(geometry, material);
-      line.position.set((Math.random() - 0.5) * 40, (Math.random() - 0.5) * 24, -Math.random() * 260);
-      this.speedLines.push(line);
-      this.scene.add(line);
-    }
-  }
-
-  private spawnMuzzleFlash() {
-    const geo = new THREE.SphereGeometry(0.33, 8, 8);
-    const mat = new THREE.MeshBasicMaterial({ color: '#e9feff', transparent: true, opacity: 1 });
-    const mesh = new THREE.Mesh(geo, mat);
-    mesh.position.copy(this.player.position).add(new THREE.Vector3(0, 0.08, -1.45));
-    this.scene.add(mesh);
-    this.particles.push({ mesh, velocity: new THREE.Vector3(0, 0, -4), life: 0.14, maxLife: 0.14 });
-  }
-
-  private createExplosion(origin: THREE.Vector3, count: number, color: string, speed = 1) {
-    for (let i = 0; i < count; i += 1) {
-      const geo = new THREE.TetrahedronGeometry(0.17 + Math.random() * 0.26);
-      const mat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 1 });
-      const mesh = new THREE.Mesh(geo, mat);
-      mesh.position.copy(origin);
-
-      const vel = new THREE.Vector3((Math.random() - 0.5) * 16 * speed, (Math.random() - 0.5) * 16 * speed, (Math.random() - 0.5) * 16 * speed);
-      this.scene.add(mesh);
-      this.particles.push({ mesh, velocity: vel, life: 0.5 + Math.random() * 0.45, maxLife: 1.05 });
-    }
-  }
-
-  private playerDamage(amount: number) {
-    this.playerHealth = Math.max(0, this.playerHealth - amount);
-    this.combo = 1;
-    this.comboTimer = 0;
-    this.damageFlash = 1;
-    this.shakeStrength += 0.11;
-    this.createExplosion(this.player.position.clone().add(new THREE.Vector3(0, 0, -0.4)), 22, '#ff5f6a', 1.2);
+  private gameOver() {
+    this.health = 0;
+    this.gameState = 'gameover';
+    this.paused = false;
+    this.dinoWarning = 0;
+    this.spawnSparks(this.player.position.clone(), 70, '#ff6f5a', 8.2);
+    this.updateHud();
   }
 
   private updateHud() {
-    this.callbacks.onHudUpdate({
-      score: this.score,
-      health: this.playerHealth,
-      wave: this.boss || this.bossWarningTimer > 0 ? TUNING.totalWaves + 1 : Math.min(this.wave, TUNING.totalWaves),
-      time: this.elapsed,
-      combo: this.combo,
-      earlyRush: this.elapsed < TUNING.earlyRushDuration,
-      gameState: this.gameState,
-      bossHealth: this.boss?.health,
-      bossMaxHealth: this.boss ? TUNING.bossHealth : undefined,
-      bossWarning: this.bossWarningTimer || undefined,
-    });
-  }
+    let warning: string | null = null;
+    if (this.gameState === 'playing' && this.dinoWarning > 0) warning = `⚠ DINO ALERT · IMPACT WINDOW ${this.dinoWarning.toFixed(1)}s`;
+    if (this.gameState === 'paused') warning = 'PAUSED';
 
-  get title() {
-    return GAME_TITLE;
+    this.onHud({
+      gameState: this.gameState,
+      speed: this.speed,
+      health: this.health,
+      score: this.score,
+      distance: this.distance,
+      takedowns: this.takedowns,
+      warning,
+    });
+
+    document.title = this.gameState === 'playing' ? `${GAME_TITLE} · ${Math.round(this.score)}` : GAME_TITLE;
   }
 }
