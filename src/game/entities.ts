@@ -15,11 +15,14 @@ export interface Enemy {
   mesh: THREE.Group;
   velocity: THREE.Vector3;
   health: number;
+  maxHealth: number;
   radius: number;
   fireTimer: number;
   fireCadence: number;
   isBoss?: boolean;
   phase?: number;
+  laneBias?: number;
+  hitFlash?: number;
 }
 
 export interface Obstacle {
@@ -41,6 +44,9 @@ export interface HudState {
   wave: number;
   time: number;
   gameState: GameState;
+  combo: number;
+  earlyRush: boolean;
   bossHealth?: number;
   bossMaxHealth?: number;
+  bossWarning?: number;
 }

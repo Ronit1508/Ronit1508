@@ -11,6 +11,7 @@ export class InputController {
   private dragging = false;
   private dragAnchor: THREE.Vector2 | null = null;
   private tapShoot = false;
+  private touchAutoFire = false;
 
   constructor(private element: HTMLElement | Window) {
     this.bindEvents();
@@ -39,7 +40,7 @@ export class InputController {
       this.tapShoot = false;
       return true;
     }
-    return this.isShooting;
+    return this.isShooting || this.touchAutoFire;
   }
 
   dispose() {
@@ -93,17 +94,9 @@ export class InputController {
       event.preventDefault();
     }
 
-    if (key === 'shift') {
-      this.rollPressed = true;
-    }
-
-    if (key === 'enter') {
-      this.startPressed = true;
-    }
-
-    if (key === 'r') {
-      this.restartPressed = true;
-    }
+    if (key === 'shift') this.rollPressed = true;
+    if (key === 'enter') this.startPressed = true;
+    if (key === 'r') this.restartPressed = true;
 
     this.recomputeMovement();
   };
@@ -123,27 +116,29 @@ export class InputController {
     this.movement.set(0, 0);
     this.isShooting = false;
     this.dragging = false;
+    this.touchAutoFire = false;
   };
 
   private onPointerDown = (event: PointerEvent) => {
     if (!(this.element instanceof HTMLElement)) return;
     this.dragging = true;
     this.dragAnchor = new THREE.Vector2(event.clientX, event.clientY);
-    this.isShooting = false;
+    this.touchAutoFire = event.pointerType === 'touch';
     this.element.setPointerCapture(event.pointerId);
   };
 
   private onPointerMove = (event: PointerEvent) => {
     if (!this.dragging || !this.dragAnchor) return;
-    const dx = (event.clientX - this.dragAnchor.x) / 120;
-    const dy = (event.clientY - this.dragAnchor.y) / 120;
+    const dx = (event.clientX - this.dragAnchor.x) / 90;
+    const dy = (event.clientY - this.dragAnchor.y) / 90;
     this.movement.set(THREE.MathUtils.clamp(dx, -1, 1), THREE.MathUtils.clamp(-dy, -1, 1));
   };
 
-  private onPointerUp = (_event: PointerEvent) => {
+  private onPointerUp = () => {
     this.dragging = false;
     this.dragAnchor = null;
     this.movement.set(0, 0);
+    this.touchAutoFire = false;
     this.recomputeMovement();
   };
 

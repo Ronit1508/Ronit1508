@@ -8,6 +8,8 @@ const initialHud: HudState = {
   health: TUNING.playerHealth,
   wave: 1,
   time: 0,
+  combo: 1,
+  earlyRush: true,
   gameState: 'start',
 };
 
@@ -23,7 +25,6 @@ function formatTime(seconds: number): string {
 
 export default function App() {
   const mountRef = useRef<HTMLDivElement>(null);
-  const gameRef = useRef<Game | null>(null);
   const [hud, setHud] = useState<HudState>(initialHud);
 
   useEffect(() => {
@@ -32,12 +33,8 @@ export default function App() {
     const game = new Game(mountRef.current, {
       onHudUpdate: (nextHud) => setHud(nextHud),
     });
-    gameRef.current = game;
 
-    return () => {
-      game.dispose();
-      gameRef.current = null;
-    };
+    return () => game.dispose();
   }, []);
 
   const healthPct = useMemo(() => Math.max(0, Math.min(100, (hud.health / TUNING.playerHealth) * 100)), [hud.health]);
@@ -61,14 +58,15 @@ export default function App() {
           </div>
 
           <div className="hud-card center">
-            <p className="label">{hud.bossHealth ? 'Boss Encounter' : 'Wave'}</p>
-            <p className="value">{hud.bossHealth ? 'Overlord Sigma' : `${hud.wave}/${TUNING.totalWaves}`}</p>
-            <p className="sub">Time {formatTime(hud.time)}</p>
+            <p className="label">{hud.bossHealth ? 'Boss Encounter' : hud.bossWarning ? 'Incoming' : 'Wave'}</p>
+            <p className="value">{hud.bossHealth ? 'Overlord Sigma' : hud.bossWarning ? 'WARNING' : `${hud.wave}/${TUNING.totalWaves}`}</p>
+            <p className="sub">Time {formatTime(hud.time)} · Combo x{hud.combo.toFixed(1)}</p>
           </div>
 
           <div className="hud-card right">
             <p className="label">Score</p>
             <p className="value">{hud.score.toString().padStart(6, '0')}</p>
+            {hud.earlyRush && <p className="rush-tag">EARLY RUSH BONUS</p>}
           </div>
         </div>
 
@@ -80,34 +78,42 @@ export default function App() {
             </div>
           </div>
         )}
+
+        {hud.bossWarning !== undefined && (
+          <div className="boss-warning">
+            <p>BOSS ALERT · ETA {hud.bossWarning.toFixed(1)}s</p>
+          </div>
+        )}
       </div>
 
       {hud.gameState === 'start' && (
-        <div className="overlay">
+        <div className="overlay start">
           <h1>{GAME_TITLE}</h1>
-          <p className="tagline">Retro rail-shooter through collapsing neon rifts.</p>
+          <p className="tagline">Dive into neon warp lanes and survive the first 30-second rush.</p>
           <div className="controls-grid">
-            <p><strong>Move:</strong> Arrow Keys / WASD</p>
-            <p><strong>Shoot:</strong> Space or Click/Tap</p>
+            <p><strong>Move:</strong> Arrow Keys / WASD / Drag</p>
+            <p><strong>Shoot:</strong> Space / Click / Tap (auto-fire while dragging on touch)</p>
             <p><strong>Dodge Roll:</strong> Shift</p>
-            <p><strong>Touch:</strong> Drag to steer</p>
+            <p><strong>Restart:</strong> R</p>
           </div>
-          <p className="prompt">Press Enter to Start</p>
+          <p className="prompt">Press Enter to Start Mission</p>
         </div>
       )}
 
       {hud.gameState === 'gameover' && (
-        <div className="overlay">
+        <div className="overlay gameover">
           <h1>Mission Failed</h1>
-          <p>Your final score: {hud.score}</p>
-          <p className="prompt">Press R to Restart</p>
+          <p>Final score: {hud.score.toLocaleString()}</p>
+          <p>Longest combo multiplier: x{hud.combo.toFixed(1)}</p>
+          <p className="prompt">Press R to Launch Again</p>
         </div>
       )}
 
       {hud.gameState === 'victory' && (
         <div className="overlay victory">
           <h1>Sector Cleared</h1>
-          <p>Final score: {hud.score}</p>
+          <p>Final score: {hud.score.toLocaleString()}</p>
+          <p>You shattered the Overlord dreadnought.</p>
           <p className="prompt">Press R to Run Again</p>
         </div>
       )}
