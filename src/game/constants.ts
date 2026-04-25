@@ -1,0 +1,41 @@
+export const GAME_TITLE = 'Nebula Run';
+
+export const TUNING = {
+  playerSpeed: 23,
+  playerBoostSpeed: 31,
+  playerBoundsX: 15,
+  playerBoundsY: 8.8,
+  playerHealth: 100,
+  fireCooldown: 0.11,
+  rollDuration: 0.45,
+  playerBulletSpeed: 74,
+  playerBulletDamage: 22,
+  enemySpeed: 16,
+  enemyBulletSpeed: 25,
+  enemyBulletDamage: 11,
+  enemyHealth: 30,
+  enemyFireChance: 1.15,
+  enemySpawnRate: 1.0,
+  obstacleSpeed: 13,
+  obstacleSpawnRate: 1.5,
+  obstacleDamage: 16,
+  waveDuration: 22,
+  totalWaves: 3,
+  bossWarningDuration: 4,
+  bossHealth: 680,
+  bossSpeed: 8,
+  bossBulletSpeed: 28,
+  bossFireInterval: 0.95,
+  bossContactDamage: 30,
+  shakeDamping: 9,
+  hitPause: 0.045,
+  earlyRushDuration: 30,
+};
+
+export const LANE_Z = {
+  player: 0,
+  enemySpawn: -165,
+  obstacleSpawn: -180,
+  cleanupNear: 28,
+  cleanupFar: -220,
+};
